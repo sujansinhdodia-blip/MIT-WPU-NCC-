@@ -1,15 +1,23 @@
 import { redirect } from "next/navigation";
-import { auth } from "@/lib/auth";
+import { getSessionUser, isApprovedAccount } from "@/lib/guard";
 
 export default async function AdminLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  const session = await auth();
+  const user = await getSessionUser();
 
-  if (!session?.user?.id || session.user.role !== "ADMIN") {
+  if (!user) {
     redirect("/login");
+  }
+
+  if (!isApprovedAccount(user)) {
+    redirect("/pending");
+  }
+
+  if (user.role !== "ADMIN") {
+    redirect("/dashboard");
   }
 
   return (

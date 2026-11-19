@@ -1,11 +1,21 @@
 import { NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
+import { authorize } from "@/lib/guard";
 import prisma from "@/lib/prisma";
+import { USER_OMIT } from "@/lib/user-fields.mjs";
+import { validateMarks } from "@/lib/attendance-rules.mjs";
+import { eligibleCadetWhere } from "@/lib/attendance-eligibility.mjs";
+import {
+  createSession,
+  markAttendance,
+  transitionSession,
+} from "@/lib/attendance-service.mjs";
+import { serviceErrorResponse } from "@/lib/http";
 
-export async function GET(req: Request) {
-  const session = await auth();
-  if (session?.user?.role !== "ADMIN") {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
+export async function GET(_req: Request) {
+  const authz = await authorize(["ADMIN", "OFFICER"]);
+
+  if (!authz.ok) {
+    return authz.response;
   }
 
   try {
@@ -14,6 +24,7 @@ export async function GET(req: Request) {
         attendances: {
           include: {
             user: {
+              omit: USER_OMIT,
               include: { cadetProfile: true },
             },
           },
@@ -30,9 +41,10 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const session = await auth();
-  if (session?.user?.role !== "ADMIN") {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
+  const authz = await authorize(["ADMIN", "OFFICER"]);
+
+  if (!authz.ok) {
+    return authz.response;
   }
 
   try {
@@ -46,29 +58,65 @@ export async function POST(req: Request) {
       );
     }
 
-    // Create session and attendance records in transaction
-    const newSession = await prisma.attendanceSession.create({
-      data: {
-        title,
-        type,
-        date: new Date(date),
-        startTime: startTime || null,
-        endTime: endTime || null,
-        attendances: {
-          create: marks.map((m: { userId: string; status: string }) => ({
-            userId: m.userId,
-            status: m.status || "PRESENT",
-          })),
+    const validation = validateMarks(marks);
+
+    if (!validation.ok) {
+      return NextResponse.json(
+        { error: validation.errors[0]?.message ?? "The marks are not valid" },
+        { status: 400 }
+      );
+    }
+
+    const requestedIds = validation.marks.map((mark) => mark.userId);
+
+    const eligible = await prisma.user.findMany({
+      where: eligibleCadetWhere({ id: { in: requestedIds } }),
+      select: { id: true },
+    });
+
+    const eligibleIds = new Set(eligible.map((cadet) => cadet.id));
+    const ineligible = requestedIds.filter((id) => !eligibleIds.has(id));
+
+    if (ineligible.length > 0) {
+      return NextResponse.json(
+        {
+          error:
+            "Attendance can only be recorded for cadets with an approved account",
         },
-      },
-      include: {
-        attendances: true,
+        { status: 400 }
+      );
+    }
+
+    // The session follows the same lifecycle as every other session. It is
+    // created as a draft, opened and only then the roll is marked.
+    const session = await createSession(prisma, {
+      actor: authz.user,
+      input: {
+        title,
+        activityType: type,
+        date,
+        startTime,
+        endTime,
       },
     });
 
-    return NextResponse.json({ success: true, session: newSession }, { status: 201 });
+    const opened = await transitionSession(prisma, {
+      actor: authz.user,
+      sessionId: session.id,
+      action: "open",
+    });
+
+    const result = await markAttendance(prisma, {
+      actor: authz.user,
+      sessionId: session.id,
+      marks: validation.marks,
+    });
+
+    return NextResponse.json(
+      { success: true, session: { ...opened, ...result } },
+      { status: 201 }
+    );
   } catch (error) {
-    console.error("Attendance creation error:", error);
-    return NextResponse.json({ error: "Failed to log attendance" }, { status: 500 });
+    return serviceErrorResponse(error, "Failed to log attendance");
   }
 }

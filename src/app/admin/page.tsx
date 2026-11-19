@@ -1,7 +1,8 @@
 import { Metadata } from "next";
 import { redirect } from "next/navigation";
-import { auth } from "@/lib/auth";
+import { getSessionUser, isApprovedAccount } from "@/lib/guard";
 import prisma from "@/lib/prisma";
+import { USER_OMIT } from "@/lib/user-fields.mjs";
 import AdminClient from "./AdminClient";
 
 export const metadata: Metadata = {
@@ -16,13 +17,17 @@ export const metadata: Metadata = {
 };
 
 export default async function AdminPage() {
-  const session = await auth();
+  const user = await getSessionUser();
 
-  if (!session?.user?.id) {
+  if (!user) {
     redirect("/login");
   }
 
-  if (session.user.role !== "ADMIN") {
+  if (!isApprovedAccount(user)) {
+    redirect("/pending");
+  }
+
+  if (user.role !== "ADMIN") {
     redirect("/");
   }
 
@@ -31,6 +36,7 @@ export default async function AdminPage() {
     await Promise.all([
       prisma.user.findMany({
         where: { role: "CADET" },
+        omit: USER_OMIT,
         include: {
           cadetProfile: true,
           attendances: true,
@@ -42,6 +48,7 @@ export default async function AdminPage() {
           attendances: {
             include: {
               user: {
+                omit: USER_OMIT,
                 include: { cadetProfile: true },
               },
             },
@@ -61,21 +68,25 @@ export default async function AdminPage() {
     ]);
 
   const totalCadets = cadets.length;
-  const pendingCount = cadets.filter(
-    (c) => c.cadetProfile?.status === "PENDING"
+  // A deactivated cadet is not an active cadet any more. It stays in the list
+  // so that the administrator can see and reactivate it, but it is not
+  // counted as a pending or an approved member of the unit.
+  const activeCadets = cadets.filter((c) => !c.deactivatedAt);
+  const pendingCount = activeCadets.filter(
+    (c) => c.approvalStatus === "PENDING"
   ).length;
-  const approvedCount = cadets.filter(
-    (c) => c.cadetProfile?.status === "APPROVED"
+  const approvedCount = activeCadets.filter(
+    (c) => c.approvalStatus === "APPROVED"
   ).length;
   const totalSessions = sessions.length;
 
   return (
     <AdminClient
-      initialCadets={cadets as any}
-      initialSessions={sessions as any}
-      initialMaterials={materials as any}
-      initialAnnouncements={announcements as any}
-      initialMessages={messages as any}
+      initialCadets={cadets}
+      initialSessions={sessions}
+      initialMaterials={materials}
+      initialAnnouncements={announcements}
+      initialMessages={messages}
       stats={{
         totalCadets,
         pendingCount,

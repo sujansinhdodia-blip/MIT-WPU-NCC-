@@ -1,9 +1,12 @@
 import { NextResponse } from "next/server";
-import { requireAdmin } from "@/lib/guard";
+import { authorize } from "@/lib/guard";
 import prisma from "@/lib/prisma";
 
 export async function GET(req: Request) {
-  await requireAdmin();
+  const authz = await authorize(["ADMIN"]);
+  if (!authz.ok) {
+    return authz.response;
+  }
 
   try {
     const { searchParams } = new URL(req.url);
@@ -27,7 +30,10 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  await requireAdmin();
+  const authz = await authorize(["ADMIN"]);
+  if (!authz.ok) {
+    return authz.response;
+  }
 
   try {
     const body = await req.json();
@@ -40,20 +46,20 @@ export async function POST(req: Request) {
       );
     }
 
-    const updated = await prisma.contactMessage.updateMany({
+    const updated = await prisma.contactMessage.update({
       where: { id: messageId },
       data: { isRead: true },
     });
 
-    if (updated.count === 0) {
+    return NextResponse.json({ success: true, message: updated });
+  } catch (error: unknown) {
+    const prismaError = error as { code?: string };
+    if (prismaError.code === "P2025") {
       return NextResponse.json(
         { error: "Message not found" },
         { status: 404 }
       );
     }
-
-    return NextResponse.json({ success: true });
-  } catch (error) {
     console.error("Failed to mark message read:", error);
     return NextResponse.json(
       { error: "Failed to update message" },

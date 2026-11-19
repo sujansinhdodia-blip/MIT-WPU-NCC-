@@ -1,103 +1,90 @@
 import NextAuth from "next-auth";
-import CredentialsProvider from "next-auth/providers/credentials";
-import bcrypt from "bcryptjs";
+import GoogleProvider from "next-auth/providers/google";
 import prisma from "@/lib/prisma";
+import { isRole, type Role } from "@/lib/roles";
+import {
+  parseAllowedEmailDomains,
+} from "@/lib/eligibility.mjs";
+import { resolveGoogleAccount } from "@/lib/account-service.mjs";
 
-declare module "next-auth/jwt" {
-  interface JWT {
-    role?: string;
-    id?: string;
-  }
-}
-
-declare module "next-auth" {
-  interface Session {
-    user: {
-      id: string;
-      name?: string | null;
-      email?: string | null;
-      image?: string | null;
-      role?: string;
-    };
-  }
-}
+export const allowedEmailDomains = parseAllowedEmailDomains(
+  process.env.ALLOWED_EMAIL_DOMAIN
+);
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
-  session: { strategy: "jwt", maxAge: 60 * 60 },
-  pages: {
-    signIn: "/login",
-    signOut: "/login",
-  },
   providers: [
-    CredentialsProvider({
-      name: "credentials",
-      credentials: {
-        email: { label: "Email", type: "email" },
-        password: { label: "Password", type: "password" },
-      },
-      async authorize(credentials) {
-        if (!credentials?.email || !credentials?.password) {
-          return null;
-        }
-
-        const email = credentials.email.toString().trim().toLowerCase();
-        const password = credentials.password.toString();
-
-        // Rate limiting hint: check for suspicious patterns
-        if (password.length < 6) {
-          return null;
-        }
-
-        const user = await prisma.user.findUnique({
-          where: { email },
-        });
-
-        if (!user) return null;
-
-        // Use constant-time comparison via bcrypt
-        const isPasswordValid = await bcrypt.compare(
-          password,
-          user.password
-        );
-
-        if (!isPasswordValid) return null;
-
-        return {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-        };
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      authorization: {
+        params: {
+          prompt: "select_account",
+        },
       },
     }),
   ],
   callbacks: {
+    async signIn({ user, account, profile }) {
+      if (account?.provider !== "google") {
+        return false;
+      }
+
+      const emailVerified = (profile as { email_verified?: boolean } | undefined)
+        ?.email_verified;
+
+      const result = await resolveGoogleAccount(prisma, {
+        provider: account.provider,
+        email: user.email,
+        emailVerified,
+        name: user.name,
+        image: user.image,
+        allowedEmailDomains,
+      });
+
+      if (!result.ok) {
+        console.warn(`Google sign-in refused (${result.reason}).`);
+        return false;
+      }
+
+      const dbUser = result.user;
+
+      (user as { id: string }).id = dbUser.id;
+      (user as { role: Role }).role = dbUser.role as Role;
+      (user as { approvalStatus: string }).approvalStatus =
+        dbUser.approvalStatus;
+
+      return true;
+    },
     async jwt({ token, user }) {
       if (user) {
-        token.role = (user as { role: string }).role;
-        token.id = user.id;
+        token.id = (user as { id: string }).id;
+        token.role = (user as { role?: Role }).role;
+        token.approvalStatus = (user as { approvalStatus?: string })
+          .approvalStatus;
       }
       return token;
     },
     async session({ session, token }) {
-      if (session.user && token.role && token.id) {
-        (session.user as { role: string }).role = token.role as string;
-        (session.user as { id: string }).id = token.id as string;
+      if (session.user) {
+        session.user.id = token.id ?? token.sub ?? "";
+        if (isRole(token.role)) {
+          session.user.role = token.role;
+        }
+        if (token.approvalStatus) {
+          session.user.approvalStatus = token.approvalStatus;
+        }
       }
       return session;
     },
   },
-  cookies: {
-    sessionToken: {
-      name: process.env.NODE_ENV === "production" ? `__Secure-next-auth.session-token` : `next-auth.session-token`,
-      options: {
-        httpOnly: true,
-        sameSite: "lax",
-        path: "/",
-        secure: process.env.NODE_ENV === "production",
-      },
-    },
+  session: {
+    strategy: "jwt",
+    maxAge: 60 * 60,
   },
-  // Disable CSRF check for signout to allow proper session clearing
+  pages: {
+    signIn: "/login",
+    signOut: "/login",
+    error: "/login",
+  },
   trustHost: true,
 });
